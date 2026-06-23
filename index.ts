@@ -273,19 +273,21 @@ app.post("/mcp", async (req, res) => {
         },
       });
 
+      console.log("Connecting MCP server...");
       await server.connect(transport);
     }
 
     await transport.handleRequest(req, res, req.body);
+
   } catch (error) {
     console.error("POST /mcp error:", error);
+    console.error(error);
 
     res.status(500).json({
-      error: error instanceof Error ? error.message : String(error)
+      error: error instanceof Error ? error.stack : String(error)
     });
   }
-});
-
+});   // ← THIS WAS MISSING
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
