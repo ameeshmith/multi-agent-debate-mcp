@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-/*  Multi‑Agent Debate Server
+/*  Multi‑Agent Debate Server
  *  -------------------------
  *  Lets multiple "personas" argue, rebut, and judge a claim in
  *  structured rounds.  See the TOOL description below for usage.
@@ -46,6 +46,7 @@ interface Verdict {
 }
 
 /* ---------- SERVER IMPLEMENTATION ---------- */
+/* One instance per MCP session — never shared across sessions. */
 
 class MultiAgentDebateServer {
   private history: ArgumentRecord[] = [];
@@ -71,6 +72,12 @@ class MultiAgentDebateServer {
     }
     if (typeof data.needsMoreRounds !== "boolean") {
       throw new Error("needsMoreRounds must be boolean");
+    }
+    if (
+      action === "rebut" &&
+      (!data.targetAgentId || typeof data.targetAgentId !== "string")
+    ) {
+      throw new Error("targetAgentId is required for action:\"rebut\"");
     }
 
     return {
@@ -98,13 +105,25 @@ class MultiAgentDebateServer {
       `[${rec.action.toUpperCase()}]`
     )} ${rec.agentId} (round ${rec.round})${rec.targetAgentId ? ` → ${rec.targetAgentId}` : ""
       }`;
-    const border = "─".repeat(Math.max(header.length, rec.content.length) + 4);
+
+    // Content may be multi-line; pad each line independently so the
+    // box actually stays a box instead of going ragged.
+    const contentLines = rec.content.split("\n");
+    const innerWidth = Math.max(
+      header.length,
+      ...contentLines.map((l) => l.length)
+    );
+    const border = "─".repeat(innerWidth + 2);
+
+    const renderedLines = contentLines
+      .map((l) => `│ ${l.padEnd(innerWidth)} │`)
+      .join("\n");
 
     console.error(`
 ┌${border}┐
-│ ${header.padEnd(border.length - 2)} │
+│ ${header.padEnd(innerWidth)} │
 ├${border}┤
-│ ${rec.content.padEnd(border.length - 2)} │
+${renderedLines}
 └${border}┘
 `);
   }
@@ -124,6 +143,11 @@ class MultiAgentDebateServer {
         }
         if (!d.content || d.content.trim() === "") {
           throw new Error("content required for this action");
+        }
+        if (d.targetAgentId && !this.agents.has(d.targetAgentId)) {
+          throw new Error(
+            `targetAgentId "${d.targetAgentId}" is not a registered agent`
+          );
         }
 
         /* store history */
@@ -203,7 +227,7 @@ Parameters:
 - round (int ≥1)              : Debate round number
 - action (string)             : "register" | "argue" | "rebut" | "judge"
 - content (string, optional)  : Argument text or verdict
-- targetAgentId (string opt.) : Agent being rebutted (only for action:"rebut")
+- targetAgentId (string opt.) : Agent being rebutted (required for action:"rebut")
 - needsMoreRounds (boolean)   : True if additional debate rounds desired`,
   inputSchema: {
     type: "object",
@@ -219,33 +243,64 @@ Parameters:
   },
 };
 
-/* ---------- MCP SERVER WIRING ---------- */
+/* ---------- PER-SESSION WIRING ---------- */
 
-const server = new Server(
-  {
-    name: "multi-agent-debate-server",
-    version: "0.1.0",
-  },
-  {
-    capabilities: { tools: {} },
+interface SessionEntry {
+  transport: StreamableHTTPServerTransport;
+  mcpServer: Server;
+  debateServer: MultiAgentDebateServer;
+  lastSeen: number;
+}
+
+const sessions: Record<string, SessionEntry> = {};
+
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes idle timeout
+const SWEEP_INTERVAL_MS = 5 * 60 * 1000; // sweep every 5 minutes
+
+function createMcpServerForSession(debateServer: MultiAgentDebateServer): Server {
+  const mcpServer = new Server(
+    {
+      name: "multi-agent-debate-server",
+      version: "0.2.0",
+    },
+    {
+      capabilities: { tools: {} },
+    }
+  );
+
+  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [MULTI_AGENT_DEBATE_TOOL],
+  }));
+
+  mcpServer.setRequestHandler(CallToolRequestSchema, async (req) => {
+    if (req.params.name === "multiagentdebate") {
+      return debateServer.process(req.params.arguments);
+    }
+    return {
+      content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }],
+      isError: true,
+    };
+  });
+
+  return mcpServer;
+}
+
+/* Idle-session sweep: cleans up sessions that were never explicitly
+ * deleted (client crashed, network dropped, browser closed, etc). */
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, entry] of Object.entries(sessions)) {
+    if (now - entry.lastSeen > SESSION_TTL_MS) {
+      console.log(`Sweeping idle session: ${sessionId}`);
+      try {
+        entry.transport.close?.();
+      } catch (err) {
+        console.error(`Error closing transport for ${sessionId}:`, err);
+      }
+      delete sessions[sessionId];
+    }
   }
-);
-
-const debateServer = new MultiAgentDebateServer();
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [MULTI_AGENT_DEBATE_TOOL],
-}));
-
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  if (req.params.name === "multiagentdebate") {
-    return debateServer.process(req.params.arguments);
-  }
-  return {
-    content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }],
-    isError: true,
-  };
-});
+}, SWEEP_INTERVAL_MS);
 
 /* ---------- HTTP BOOT ---------- */
 
@@ -253,64 +308,81 @@ const app = express();
 
 app.use(express.json());
 
-const transports: Record<string, StreamableHTTPServerTransport> = {};
-
 app.post("/mcp", async (req, res) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-    let transport: StreamableHTTPServerTransport;
+    let entry: SessionEntry;
 
-    if (sessionId && transports[sessionId]) {
-      transport = transports[sessionId];
+    if (sessionId && sessions[sessionId]) {
+      entry = sessions[sessionId];
+      entry.lastSeen = Date.now();
       console.log(`Using existing session: ${sessionId}`);
     } else {
-      transport = new StreamableHTTPServerTransport({
+      // Fresh session: every session gets its own debate state.
+      const debateServer = new MultiAgentDebateServer();
+      const mcpServer = createMcpServerForSession(debateServer);
+
+      const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
-        onsessioninitialized: (sessionId) => {
-          console.log(`Session initialized: ${sessionId}`);
-          transports[sessionId] = transport;
+        onsessioninitialized: (newSessionId) => {
+          console.log(`Session initialized: ${newSessionId}`);
+          sessions[newSessionId] = {
+            transport,
+            mcpServer,
+            debateServer,
+            lastSeen: Date.now(),
+          };
         },
       });
 
       console.log("Connecting MCP server...");
-      await server.connect(transport);
+      await mcpServer.connect(transport);
+
+      // entry is only used below for the immediate request; the real
+      // bookkeeping happens in onsessioninitialized once the SDK
+      // assigns the session id.
+      entry = { transport, mcpServer, debateServer, lastSeen: Date.now() };
     }
 
-    await transport.handleRequest(req, res, req.body);
-
+    await entry.transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.error("POST /mcp error:", error);
     console.error(error);
 
     res.status(500).json({
-      error: error instanceof Error ? error.stack : String(error)
+      error: error instanceof Error ? error.stack : String(error),
     });
   }
-});   // ← THIS WAS MISSING
+});
+
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-  if (!sessionId || !transports[sessionId]) {
+  if (!sessionId || !sessions[sessionId]) {
     res.status(400).send("Mcp-Session-Id header is required");
     return;
   }
 
-  await transports[sessionId].handleRequest(req, res);
-  return;
+  sessions[sessionId].lastSeen = Date.now();
+  await sessions[sessionId].transport.handleRequest(req, res);
 });
 
 app.delete("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-  if (sessionId && transports[sessionId]) {
-    delete transports[sessionId];
+  if (sessionId && sessions[sessionId]) {
+    try {
+      sessions[sessionId].transport.close?.();
+    } catch (err) {
+      console.error(`Error closing transport for ${sessionId}:`, err);
+    }
+    delete sessions[sessionId];
     console.log(`Deleted session: ${sessionId}`);
   }
 
   res.status(200).send("Session Deleted");
 });
-
 
 const PORT = process.env.PORT || 3001;
 
