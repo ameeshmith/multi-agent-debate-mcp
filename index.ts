@@ -306,8 +306,9 @@ app.delete("/mcp", async (req, res) => {
   res.status(200).send("Session Deleted");
 });
 
-app.listen(3001, () => {
-  console.log(
-    "Multi-Agent Debate MCP running on http://localhost:3001/mcp"
-  );
+
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, () => {
+  console.log(`Multi-Agent Debate MCP running on port ${PORT}`);
 });
