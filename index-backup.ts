@@ -5,11 +5,9 @@
  *  Lets multiple "personas" argue, rebut, and judge a claim in
  *  structured rounds.  See the TOOL description below for usage.
  */
-import crypto from "crypto";
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import express from "express";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -89,15 +87,16 @@ class MultiAgentDebateServer {
       rec.action === "judge"
         ? chalk.yellow
         : rec.agentId === "pro"
-          ? chalk.green
-          : rec.agentId === "con"
-            ? chalk.red
-            : chalk.cyan;
+        ? chalk.green
+        : rec.agentId === "con"
+        ? chalk.red
+        : chalk.cyan;
 
     const header = `${colour(
       `[${rec.action.toUpperCase()}]`
-    )} ${rec.agentId} (round ${rec.round})${rec.targetAgentId ? ` → ${rec.targetAgentId}` : ""
-      }`;
+    )} ${rec.agentId} (round ${rec.round})${
+      rec.targetAgentId ? ` → ${rec.targetAgentId}` : ""
+    }`;
     const border = "─".repeat(Math.max(header.length, rec.content.length) + 4);
 
     console.error(`
@@ -247,67 +246,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   };
 });
 
-/* ---------- HTTP BOOT ---------- */
+/* ---------- BOOT ---------- */
 
-const app = express();
-
-app.use(express.json());
-
-const transports: Record<string, StreamableHTTPServerTransport> = {};
-
-app.post("/mcp", async (req, res) => {
-  try {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-    let transport: StreamableHTTPServerTransport;
-
-    if (sessionId && transports[sessionId]) {
-      transport = transports[sessionId];
-      console.log(`Using existing session: ${sessionId}`);
-    } else {
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => crypto.randomUUID(),
-        onsessioninitialized: (sessionId) => {
-          console.log(`Session initialized: ${sessionId}`);
-          transports[sessionId] = transport;
-        },
-      });
-
-      await server.connect(transport);
-    }
-
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error("POST /mcp error:", error);
-    res.status(500).send("MCP Error");
-  }
-});
-
-app.get("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).send("Mcp-Session-Id header is required");
-    return;
-  }
-
-  await transports[sessionId].handleRequest(req, res);
-  return;
-});
-
-app.delete("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-  if (sessionId && transports[sessionId]) {
-    delete transports[sessionId];
-    console.log(`Deleted session: ${sessionId}`);
-  }
-
-  res.status(200).send("Session Deleted");
-});
-
-app.listen(3001, () => {
-  console.log(
-    "Multi-Agent Debate MCP running on http://localhost:3001/mcp"
-  );
+(async () => {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("Multi‑Agent Debate MCP Server listening on stdio");
+})().catch((e) => {
+  console.error("Fatal error running server:", e);
+  process.exit(1);
 });
