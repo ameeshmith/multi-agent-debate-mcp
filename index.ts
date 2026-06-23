@@ -279,7 +279,10 @@ app.post("/mcp", async (req, res) => {
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.error("POST /mcp error:", error);
-    res.status(500).send("MCP Error");
+
+    res.status(500).json({
+      error: error instanceof Error ? error.message : String(error)
+    });
   }
 });
 
